@@ -1,6 +1,8 @@
 """Gmail OAuth2 authentication module."""
 
+import json
 import os
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,15 +15,28 @@ TOKEN_FILE = "token.json"
 CREDENTIALS_FILE = "credentials.json"
 
 
+def _token_has_required_scopes() -> bool:
+    """token.json에 저장된 스코프가 현재 SCOPES를 모두 포함하는지 확인합니다."""
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        stored = data.get("scopes") or []
+        return all(s in stored for s in SCOPES)
+    except Exception:
+        return False
+
+
 def get_gmail_service():
     """Authenticate and return a Gmail API service instance."""
     creds = None
 
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-        # 저장된 토큰의 스코프가 현재 요구 스코프와 다르면 재인증
-        if creds and not all(s in (creds.scopes or []) for s in SCOPES):
-            creds = None
+        if _token_has_required_scopes():
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        else:
+            # 스코프 불일치: 토큰 삭제 후 재인증
+            os.remove(TOKEN_FILE)
+            print("인증 권한이 변경되었습니다. 브라우저에서 재인증을 진행합니다...")
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
