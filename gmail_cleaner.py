@@ -1,7 +1,8 @@
-"""Gmail Cleaner - Interactive tool to clean up your Gmail inbox."""
+"""Gmail Auto Cleaner — 자동으로 분류·라벨링·아카이브·삭제를 처리합니다."""
 
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import click
@@ -9,7 +10,7 @@ from googleapiclient.errors import HttpError
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 from rich.table import Table
 from rich import box
 
@@ -18,7 +19,99 @@ from auth import get_gmail_service
 console = Console()
 
 MAX_RESULTS_PER_PAGE = 500
-BATCH_SIZE = 50  # Gmail API batch delete limit
+BATCH_SIZE = 50
+
+
+# ---------------------------------------------------------------------------
+# Auto rules definition
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AutoRule:
+    name: str
+    description: str
+    query: str
+    action: str          # "delete" or "archive"
+    label: Optional[str] = None
+    safe: bool = False   # True → 자동 처리(아카이브), False → 확인 후 처리(삭제)
+
+
+# 규칙 순서: 삭제 그룹 먼저, 아카이브 그룹 나중
+AUTO_RULES: list[AutoRule] = [
+    AutoRule(
+        name="Newsletter",
+        description="뉴스레터 / 구독 메일",
+        query="unsubscribe in:inbox",
+        label="AutoClean/Newsletter",
+        action="delete",
+        safe=False,
+    ),
+    AutoRule(
+        name="Promotion",
+        description="프로모션 메일",
+        query="category:promotions",
+        label="AutoClean/Promotion",
+        action="delete",
+        safe=False,
+    ),
+    AutoRule(
+        name="Social",
+        description="소셜 / SNS 알림 메일",
+        query="category:social",
+        label="AutoClean/Social",
+        action="delete",
+        safe=False,
+    ),
+    AutoRule(
+        name="NoReply",
+        description="발신 전용(noreply) 메일",
+        query="(from:noreply OR from:no-reply OR from:donotreply) in:inbox",
+        label="AutoClean/NoReply",
+        action="archive",
+        safe=True,
+    ),
+    AutoRule(
+        name="OldMail",
+        description="1년 이상 된 메일",
+        query="older_than:365d in:inbox",
+        label="AutoClean/OldMail",
+        action="archive",
+        safe=True,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Gmail label helpers
+# ---------------------------------------------------------------------------
+
+def get_or_create_label(service, label_name: str) -> str:
+    """라벨이 없으면 생성하고 ID를 반환합니다."""
+    result = service.users().labels().list(userId="me").execute()
+    for lbl in result.get("labels", []):
+        if lbl["name"] == label_name:
+            return lbl["id"]
+
+    created = service.users().labels().create(
+        userId="me",
+        body={
+            "name": label_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        },
+    ).execute()
+    return created["id"]
+
+
+def apply_label_batch(service, msg_ids: list[str], label_id: str):
+    """메시지 목록에 라벨을 배치로 적용합니다."""
+    for i in range(0, len(msg_ids), BATCH_SIZE):
+        batch = msg_ids[i : i + BATCH_SIZE]
+        service.users().messages().batchModify(
+            userId="me",
+            body={"ids": batch, "addLabelIds": [label_id]},
+        ).execute()
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -26,68 +119,53 @@ BATCH_SIZE = 50  # Gmail API batch delete limit
 # ---------------------------------------------------------------------------
 
 def fetch_message_ids(service, query: str, max_results: Optional[int] = None) -> list[str]:
-    """Return all message IDs matching a Gmail search query."""
-    ids = []
+    """Gmail 검색 쿼리에 매칭되는 메시지 ID 전체를 반환합니다."""
+    ids: list[str] = []
     page_token = None
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Searching emails...", total=None)
+    while True:
+        kwargs: dict = {
+            "userId": "me",
+            "q": query,
+            "maxResults": MAX_RESULTS_PER_PAGE,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
 
-        while True:
-            kwargs = {
-                "userId": "me",
-                "q": query,
-                "maxResults": MAX_RESULTS_PER_PAGE,
-            }
-            if page_token:
-                kwargs["pageToken"] = page_token
+        result = service.users().messages().list(**kwargs).execute()
+        messages = result.get("messages", [])
+        ids.extend(m["id"] for m in messages)
 
-            result = service.users().messages().list(**kwargs).execute()
-            messages = result.get("messages", [])
-            ids.extend(m["id"] for m in messages)
+        if max_results and len(ids) >= max_results:
+            ids = ids[:max_results]
+            break
 
-            progress.update(task, description=f"Found {len(ids)} emails...")
-
-            if max_results and len(ids) >= max_results:
-                ids = ids[:max_results]
-                break
-
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
 
     return ids
 
 
 def get_message_snippet(service, msg_id: str) -> dict:
-    """Fetch sender, subject, and date for a message."""
+    """메시지의 발신자·제목·날짜를 가져옵니다."""
     msg = service.users().messages().get(
         userId="me", id=msg_id, format="metadata",
-        metadataHeaders=["From", "Subject", "Date"]
+        metadataHeaders=["From", "Subject", "Date"],
     ).execute()
-
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
     return {
         "id": msg_id,
-        "from": headers.get("From", "(unknown)"),
-        "subject": headers.get("Subject", "(no subject)"),
+        "from": headers.get("From", "(알 수 없음)"),
+        "subject": headers.get("Subject", "(제목 없음)"),
         "date": headers.get("Date", ""),
     }
 
 
-def batch_delete(service, msg_ids: list[str], dry_run: bool = False) -> int:
-    """Delete messages in batches. Returns count of deleted messages."""
-    if dry_run:
-        console.print(f"[yellow][DRY RUN] Would delete {len(msg_ids)} emails.[/yellow]")
-        return 0
-
+def batch_delete(service, msg_ids: list[str]) -> int:
+    """메시지를 배치로 삭제(휴지통 이동)합니다."""
     deleted = 0
-    batches = [msg_ids[i:i + BATCH_SIZE] for i in range(0, len(msg_ids), BATCH_SIZE)]
+    batches = [msg_ids[i : i + BATCH_SIZE] for i in range(0, len(msg_ids), BATCH_SIZE)]
 
     with Progress(
         SpinnerColumn(),
@@ -96,8 +174,7 @@ def batch_delete(service, msg_ids: list[str], dry_run: bool = False) -> int:
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Deleting...", total=len(batches))
-
+        task = progress.add_task("  삭제 중...", total=len(batches))
         for batch in batches:
             service.users().messages().batchDelete(
                 userId="me",
@@ -105,19 +182,15 @@ def batch_delete(service, msg_ids: list[str], dry_run: bool = False) -> int:
             ).execute()
             deleted += len(batch)
             progress.advance(task)
-            time.sleep(0.1)  # avoid rate limiting
+            time.sleep(0.1)
 
     return deleted
 
 
-def batch_archive(service, msg_ids: list[str], dry_run: bool = False) -> int:
-    """Archive (remove INBOX label) messages in batches."""
-    if dry_run:
-        console.print(f"[yellow][DRY RUN] Would archive {len(msg_ids)} emails.[/yellow]")
-        return 0
-
+def batch_archive(service, msg_ids: list[str]) -> int:
+    """메시지를 배치로 아카이브(받은편지함에서 제거)합니다."""
     archived = 0
-    batches = [msg_ids[i:i + BATCH_SIZE] for i in range(0, len(msg_ids), BATCH_SIZE)]
+    batches = [msg_ids[i : i + BATCH_SIZE] for i in range(0, len(msg_ids), BATCH_SIZE)]
 
     with Progress(
         SpinnerColumn(),
@@ -126,15 +199,11 @@ def batch_archive(service, msg_ids: list[str], dry_run: bool = False) -> int:
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Archiving...", total=len(batches))
-
+        task = progress.add_task("  아카이브 중...", total=len(batches))
         for batch in batches:
             service.users().messages().batchModify(
                 userId="me",
-                body={
-                    "ids": batch,
-                    "removeLabelIds": ["INBOX"],
-                },
+                body={"ids": batch, "removeLabelIds": ["INBOX"]},
             ).execute()
             archived += len(batch)
             progress.advance(task)
@@ -143,304 +212,224 @@ def batch_archive(service, msg_ids: list[str], dry_run: bool = False) -> int:
     return archived
 
 
-def show_preview(service, msg_ids: list[str], limit: int = 10):
-    """Print a preview table of the first N messages."""
-    preview_ids = msg_ids[:limit]
-    table = Table(box=box.ROUNDED, show_lines=True)
-    table.add_column("From", style="cyan", max_width=35, no_wrap=True)
-    table.add_column("Subject", style="white", max_width=50, no_wrap=True)
-    table.add_column("Date", style="dim", max_width=30)
+def show_preview(service, msg_ids: list[str], limit: int = 5):
+    """샘플 메시지를 테이블로 미리 보여줍니다."""
+    table = Table(box=box.SIMPLE, show_lines=False, padding=(0, 1))
+    table.add_column("발신자", style="cyan", max_width=40, no_wrap=True)
+    table.add_column("제목", style="white", max_width=50, no_wrap=True)
+    table.add_column("날짜", style="dim", max_width=25)
 
-    for mid in preview_ids:
-        info = get_message_snippet(service, mid)
-        table.add_row(info["from"], info["subject"], info["date"])
+    for mid in msg_ids[:limit]:
+        try:
+            info = get_message_snippet(service, mid)
+            table.add_row(info["from"], info["subject"], info["date"])
+        except HttpError:
+            pass
 
     console.print(table)
     if len(msg_ids) > limit:
-        console.print(f"[dim]... and {len(msg_ids) - limit} more.[/dim]")
+        console.print(f"  [dim]... 외 {len(msg_ids) - limit}개[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
-# Individual feature commands
+# Auto pipeline
 # ---------------------------------------------------------------------------
 
-def cmd_delete_by_sender(service, dry_run: bool):
-    """Delete all emails from a specific sender."""
-    sender = Prompt.ask("[bold]Enter sender email or domain[/bold] (e.g. newsletter@example.com)")
-    if not sender.strip():
+@dataclass
+class RuleResult:
+    rule: AutoRule
+    ids: list[str] = field(default_factory=list)
+
+
+def run_auto_pipeline(service, dry_run: bool):
+    """자동 분류 → 라벨 적용 → 아카이브 → 삭제 확인 파이프라인."""
+
+    # ── Phase 1: 스캔 및 분류 ─────────────────────────────────────────────
+    console.print()
+    console.print(Panel(
+        "[bold]Phase 1[/bold]  받은편지함을 자동으로 스캔합니다.",
+        border_style="dim blue", padding=(0, 1),
+    ))
+
+    results: list[RuleResult] = []
+
+    for rule in AUTO_RULES:
+        with console.status(f"  스캔 중: [cyan]{rule.description}[/cyan]"):
+            ids = fetch_message_ids(service, rule.query)
+
+        rr = RuleResult(rule=rule, ids=ids)
+        results.append(rr)
+
+        if not rule.safe:
+            action_tag = "[bold red]삭제 예정[/bold red] [dim](확인 필요)[/dim]"
+        else:
+            action_tag = "[bold yellow]자동 아카이브[/bold yellow]"
+
+        count_tag = f"[bold]{len(ids):>6}개[/bold]" if ids else "[dim]     0개[/dim]"
+        console.print(f"  [green]✓[/green]  {rule.description:<26}  {count_tag}  →  {action_tag}")
+
+    # 아무것도 없으면 종료
+    if all(not r.ids for r in results):
+        console.print("\n[green]받은편지함이 깨끗합니다. 처리할 메일이 없습니다.[/green]")
         return
 
-    query = f"from:{sender.strip()}"
-    ids = fetch_message_ids(service, query)
-    if not ids:
-        console.print("[green]No emails found from that sender.[/green]")
-        return
+    # ── Phase 2: 라벨 적용 ────────────────────────────────────────────────
+    label_rules = [r for r in results if r.rule.label and r.ids]
 
-    console.print(f"\n[bold]Found {len(ids)} emails[/bold] from [cyan]{sender}[/cyan]\n")
-    show_preview(service, ids)
+    if label_rules:
+        console.print()
+        console.print(Panel(
+            "[bold]Phase 2[/bold]  Gmail 라벨을 생성하고 적용합니다.",
+            border_style="dim blue", padding=(0, 1),
+        ))
 
-    if Confirm.ask(f"\nDelete all [bold red]{len(ids)}[/bold red] emails?"):
-        deleted = batch_delete(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Deleted {deleted} emails.[/green]")
+        for rr in label_rules:
+            if dry_run:
+                console.print(
+                    f"  [yellow][DRY RUN][/yellow] {rr.rule.label}  "
+                    f"→  {len(rr.ids)}개 (스킵)"
+                )
+                continue
 
+            with console.status(f"  라벨 적용 중: [cyan]{rr.rule.label}[/cyan]"):
+                label_id = get_or_create_label(service, rr.rule.label)
+                apply_label_batch(service, rr.ids, label_id)
 
-def cmd_delete_by_keyword(service, dry_run: bool):
-    """Delete emails matching a search keyword."""
-    keyword = Prompt.ask("[bold]Enter search keyword or Gmail query[/bold] (e.g. 'unsubscribe', 'subject:promo')")
-    if not keyword.strip():
-        return
+            console.print(
+                f"  [green]✓[/green]  [cyan]{rr.rule.label}[/cyan]  "
+                f"→  {len(rr.ids)}개 적용 완료"
+            )
 
-    ids = fetch_message_ids(service, keyword.strip())
-    if not ids:
-        console.print("[green]No emails found.[/green]")
-        return
+    # ── Phase 3: 안전한 작업 자동 처리 (아카이브) ─────────────────────────
+    safe_results = [r for r in results if r.rule.safe and r.ids]
 
-    console.print(f"\n[bold]Found {len(ids)} emails[/bold] matching [cyan]{keyword}[/cyan]\n")
-    show_preview(service, ids)
+    if safe_results:
+        console.print()
+        console.print(Panel(
+            "[bold]Phase 3[/bold]  안전한 작업을 자동으로 처리합니다 (아카이브).",
+            border_style="dim blue", padding=(0, 1),
+        ))
 
-    if Confirm.ask(f"\nDelete all [bold red]{len(ids)}[/bold red] emails?"):
-        deleted = batch_delete(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Deleted {deleted} emails.[/green]")
+        for rr in safe_results:
+            if dry_run:
+                console.print(
+                    f"  [yellow][DRY RUN][/yellow] {rr.rule.description}  "
+                    f"→  {len(rr.ids)}개 아카이브 (스킵)"
+                )
+                continue
 
+            console.print(f"\n  [cyan]{rr.rule.description}[/cyan]  {len(rr.ids)}개")
+            archived = batch_archive(service, rr.ids)
+            console.print(f"  [green]✓[/green]  {archived}개 아카이브 완료")
 
-def cmd_delete_old_emails(service, dry_run: bool):
-    """Delete emails older than N days."""
-    days = Prompt.ask("[bold]Delete emails older than how many days?[/bold]", default="365")
-    try:
-        days_int = int(days)
-    except ValueError:
-        console.print("[red]Invalid number.[/red]")
-        return
+    # ── Phase 4: 삭제 — 그룹별 미리보기 및 확인 ─────────────────────────
+    delete_results = [r for r in results if not r.rule.safe and r.ids]
 
-    query = f"older_than:{days_int}d"
-    ids = fetch_message_ids(service, query)
-    if not ids:
-        console.print(f"[green]No emails older than {days_int} days found.[/green]")
-        return
+    if delete_results:
+        console.print()
+        console.print(Panel(
+            "[bold]Phase 4[/bold]  삭제 작업입니다. 그룹별로 확인 후 처리합니다.",
+            border_style="dim red", padding=(0, 1),
+        ))
 
-    console.print(f"\n[bold]Found {len(ids)} emails[/bold] older than [cyan]{days_int} days[/cyan]\n")
-    show_preview(service, ids)
+        # 동일 메일이 여러 삭제 그룹에 중복 포함되는 것을 방지
+        seen_delete_ids: set[str] = set()
+        total_deleted = 0
+        total_skipped = 0
 
-    if Confirm.ask(f"\nDelete all [bold red]{len(ids)}[/bold red] old emails?"):
-        deleted = batch_delete(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Deleted {deleted} emails.[/green]")
+        for idx, rr in enumerate(delete_results, 1):
+            ids_to_delete = [mid for mid in rr.ids if mid not in seen_delete_ids]
+            if not ids_to_delete:
+                continue
 
+            console.print(
+                f"\n  [bold]그룹 {idx}/{len(delete_results)}[/bold]  "
+                f"[cyan]{rr.rule.description}[/cyan]  "
+                f"→  [bold red]{len(ids_to_delete)}개[/bold red] 삭제 예정\n"
+            )
+            show_preview(service, ids_to_delete)
 
-def cmd_delete_promotions(service, dry_run: bool):
-    """Delete all emails in the Promotions category."""
-    query = "category:promotions"
-    ids = fetch_message_ids(service, query)
-    if not ids:
-        console.print("[green]No promotion emails found.[/green]")
-        return
+            if dry_run:
+                console.print(f"  [yellow][DRY RUN][/yellow] {len(ids_to_delete)}개 삭제 (스킵)\n")
+                seen_delete_ids.update(ids_to_delete)
+                total_skipped += len(ids_to_delete)
+                continue
 
-    console.print(f"\n[bold]Found {len(ids)} promotion emails[/bold]\n")
-    show_preview(service, ids)
+            if Confirm.ask(f"  [bold red]{len(ids_to_delete)}개[/bold red]를 삭제하시겠습니까?"):
+                deleted = batch_delete(service, ids_to_delete)
+                seen_delete_ids.update(ids_to_delete)
+                total_deleted += deleted
+                console.print(f"  [green]✓[/green]  {deleted}개 삭제 완료\n")
+            else:
+                console.print(f"  [dim]건너뜀: {rr.rule.description}[/dim]\n")
+                total_skipped += len(ids_to_delete)
 
-    if Confirm.ask(f"\nDelete all [bold red]{len(ids)}[/bold red] promotion emails?"):
-        deleted = batch_delete(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Deleted {deleted} promotion emails.[/green]")
+    # ── 요약 ─────────────────────────────────────────────────────────────
+    console.print()
+    console.print("─" * 58)
 
+    summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    summary.add_column("항목", style="dim", width=20)
+    summary.add_column("결과", style="bold white", justify="right")
 
-def cmd_delete_social(service, dry_run: bool):
-    """Delete all emails in the Social category."""
-    query = "category:social"
-    ids = fetch_message_ids(service, query)
-    if not ids:
-        console.print("[green]No social emails found.[/green]")
-        return
+    total_labeled = sum(len(r.ids) for r in results if r.rule.label)
+    total_archived = sum(len(r.ids) for r in results if r.rule.safe)
+    total_found = sum(len(r.ids) for r in results if not r.rule.safe)
 
-    console.print(f"\n[bold]Found {len(ids)} social emails[/bold]\n")
-    show_preview(service, ids)
+    mode_note = " [yellow](DRY RUN — 실제 처리 없음)[/yellow]" if dry_run else ""
+    summary.add_row("라벨 적용", f"{total_labeled}개")
+    summary.add_row("아카이브", f"{total_archived}개{mode_note}")
+    summary.add_row("삭제 대상", f"{total_found}개{mode_note}")
 
-    if Confirm.ask(f"\nDelete all [bold red]{len(ids)}[/bold red] social emails?"):
-        deleted = batch_delete(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Deleted {deleted} social emails.[/green]")
-
-
-def cmd_archive_read(service, dry_run: bool):
-    """Archive all read emails in inbox."""
-    query = "in:inbox is:read"
-    ids = fetch_message_ids(service, query)
-    if not ids:
-        console.print("[green]No read emails in inbox.[/green]")
-        return
-
-    console.print(f"\n[bold]Found {len(ids)} read emails[/bold] in inbox\n")
-    show_preview(service, ids)
-
-    if Confirm.ask(f"\nArchive all [bold yellow]{len(ids)}[/bold yellow] read emails?"):
-        archived = batch_archive(service, ids, dry_run)
-        if not dry_run:
-            console.print(f"[green]Archived {archived} emails.[/green]")
-
-
-def cmd_stats(service):
-    """Show inbox statistics."""
-    console.print("\n[bold]Fetching inbox statistics...[/bold]")
-
-    queries = [
-        ("Total inbox", "in:inbox"),
-        ("Unread", "in:inbox is:unread"),
-        ("Read", "in:inbox is:read"),
-        ("Promotions", "category:promotions"),
-        ("Social", "category:social"),
-        ("Updates", "category:updates"),
-        ("Forums", "category:forums"),
-        ("Older than 1 year", "older_than:365d"),
-        ("Has attachment", "has:attachment"),
-    ]
-
-    table = Table(title="Inbox Statistics", box=box.ROUNDED)
-    table.add_column("Category", style="cyan")
-    table.add_column("Count", style="bold white", justify="right")
-
-    for label, query in queries:
-        ids = fetch_message_ids(service, query, max_results=5000)
-        count_str = str(len(ids)) if len(ids) < 5000 else "5000+"
-        table.add_row(label, count_str)
-
-    console.print(table)
-
-
-def cmd_top_senders(service):
-    """Show top senders by email count."""
-    console.print("\n[bold]Analyzing top senders (scanning up to 1000 emails)...[/bold]")
-
-    ids = fetch_message_ids(service, "in:inbox", max_results=1000)
-    if not ids:
-        console.print("[green]Inbox is empty.[/green]")
-        return
-
-    sender_counts: dict[str, int] = {}
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Reading headers...", total=len(ids))
-        for mid in ids:
-            try:
-                info = get_message_snippet(service, mid)
-                sender = info["from"]
-                sender_counts[sender] = sender_counts.get(sender, 0) + 1
-            except HttpError:
-                pass
-            progress.advance(task)
-
-    sorted_senders = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)
-
-    table = Table(title="Top 20 Senders", box=box.ROUNDED, show_lines=True)
-    table.add_column("Sender", style="cyan", max_width=60, no_wrap=True)
-    table.add_column("Count", style="bold white", justify="right")
-
-    for sender, count in sorted_senders[:20]:
-        table.add_row(sender, str(count))
-
-    console.print(table)
+    console.print(Panel(
+        summary,
+        title="[bold green]완료[/bold green]",
+        border_style="green",
+    ))
 
 
 # ---------------------------------------------------------------------------
-# Main interactive menu
+# Entry point
 # ---------------------------------------------------------------------------
-
-MENU_OPTIONS = [
-    ("1", "Delete emails from a specific sender"),
-    ("2", "Delete emails by keyword / query"),
-    ("3", "Delete emails older than N days"),
-    ("4", "Delete all Promotion emails"),
-    ("5", "Delete all Social emails"),
-    ("6", "Archive all read inbox emails"),
-    ("7", "Show inbox statistics"),
-    ("8", "Show top senders"),
-    ("q", "Quit"),
-]
-
-
-def print_menu(dry_run: bool):
-    mode = "[bold yellow]DRY RUN MODE[/bold yellow]" if dry_run else "[bold green]LIVE MODE[/bold green]"
-    table = Table(box=box.ROUNDED, show_header=False, padding=(0, 2))
-    table.add_column("Key", style="bold cyan", width=4)
-    table.add_column("Action", style="white")
-
-    for key, description in MENU_OPTIONS:
-        table.add_row(key, description)
-
-    console.print(
-        Panel(
-            table,
-            title=f"[bold]Gmail Cleaner[/bold]  {mode}",
-            border_style="blue",
-        )
-    )
-
 
 @click.command()
-@click.option("--dry-run", is_flag=True, default=False, help="Preview actions without deleting anything.")
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="실제 변경 없이 결과만 미리 확인합니다.",
+)
 def main(dry_run: bool):
-    """Interactive Gmail cleanup tool."""
+    """Gmail 자동 정리 도구 — 분류·라벨링·아카이브·삭제(확인 후)를 자동으로 처리합니다."""
+    mode = "[bold yellow]DRY RUN 모드[/bold yellow]" if dry_run else "[bold green]LIVE 모드[/bold green]"
+
     console.print(Panel.fit(
-        "[bold blue]Gmail Cleaner[/bold blue]\n"
-        "[dim]Authenticate once, then manage your inbox interactively.[/dim]",
+        f"[bold blue]Gmail Auto Cleaner[/bold blue]  {mode}\n"
+        "[dim]받은편지함을 자동으로 스캔하고, 라벨 적용 → 아카이브 → 삭제(확인 후) 순서로 처리합니다.[/dim]",
         border_style="blue",
     ))
 
     if dry_run:
-        console.print("[bold yellow]Running in DRY RUN mode — no emails will be modified.[/bold yellow]\n")
+        console.print(
+            "[bold yellow]DRY RUN: 실제 삭제·아카이브·라벨 작업은 실행되지 않습니다.[/bold yellow]"
+        )
 
     try:
-        with console.status("Connecting to Gmail..."):
+        with console.status("Gmail에 연결 중..."):
             service = get_gmail_service()
-        console.print("[green]Connected to Gmail.[/green]\n")
+        console.print("[green]Gmail 연결 완료.[/green]")
     except FileNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[bold red]오류:[/bold red] {e}")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[bold red]Authentication failed:[/bold red] {e}")
+        console.print(f"[bold red]인증 실패:[/bold red] {e}")
         sys.exit(1)
 
-    while True:
-        print_menu(dry_run)
-        choice = Prompt.ask("[bold]Choose an option[/bold]", default="q").strip().lower()
-
-        console.print()
-
-        try:
-            if choice == "1":
-                cmd_delete_by_sender(service, dry_run)
-            elif choice == "2":
-                cmd_delete_by_keyword(service, dry_run)
-            elif choice == "3":
-                cmd_delete_old_emails(service, dry_run)
-            elif choice == "4":
-                cmd_delete_promotions(service, dry_run)
-            elif choice == "5":
-                cmd_delete_social(service, dry_run)
-            elif choice == "6":
-                cmd_archive_read(service, dry_run)
-            elif choice == "7":
-                cmd_stats(service)
-            elif choice == "8":
-                cmd_top_senders(service)
-            elif choice == "q":
-                console.print("[dim]Goodbye![/dim]")
-                break
-            else:
-                console.print("[red]Invalid option.[/red]")
-        except HttpError as e:
-            console.print(f"[bold red]Gmail API error:[/bold red] {e}")
-        except KeyboardInterrupt:
-            console.print("\n[dim]Interrupted.[/dim]")
-
-        console.print()
+    try:
+        run_auto_pipeline(service, dry_run)
+    except HttpError as e:
+        console.print(f"[bold red]Gmail API 오류:[/bold red] {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("\n[dim]중단되었습니다.[/dim]")
 
 
 if __name__ == "__main__":
