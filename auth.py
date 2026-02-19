@@ -6,11 +6,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Scopes required for reading and deleting emails
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.readonly",
-]
+# Full access scope required for read / modify / delete
+SCOPES = ["https://mail.google.com/"]
 
 TOKEN_FILE = "token.json"
 CREDENTIALS_FILE = "credentials.json"
@@ -22,6 +19,9 @@ def get_gmail_service():
 
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        # 저장된 토큰의 스코프가 현재 요구 스코프와 다르면 재인증
+        if creds and not all(s in (creds.scopes or []) for s in SCOPES):
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
