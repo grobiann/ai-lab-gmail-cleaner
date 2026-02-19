@@ -212,23 +212,38 @@ def batch_archive(service, msg_ids: list[str]) -> int:
     return archived
 
 
-def show_preview(service, msg_ids: list[str], limit: int = 5):
-    """샘플 메시지를 테이블로 미리 보여줍니다."""
+def show_all_emails(service, msg_ids: list[str]):
+    """삭제 대상 메시지 전체를 테이블로 출력합니다."""
+    rows = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            f"  목록 조회 중... (총 {len(msg_ids)}개)", total=len(msg_ids)
+        )
+        for mid in msg_ids:
+            try:
+                info = get_message_snippet(service, mid)
+                rows.append((info["from"], info["subject"], info["date"]))
+            except HttpError:
+                rows.append(("(조회 오류)", "", ""))
+            progress.advance(task)
+
     table = Table(box=box.SIMPLE, show_lines=False, padding=(0, 1))
+    table.add_column("No.", style="dim", width=5, justify="right")
     table.add_column("발신자", style="cyan", max_width=40, no_wrap=True)
     table.add_column("제목", style="white", max_width=50, no_wrap=True)
     table.add_column("날짜", style="dim", max_width=25)
 
-    for mid in msg_ids[:limit]:
-        try:
-            info = get_message_snippet(service, mid)
-            table.add_row(info["from"], info["subject"], info["date"])
-        except HttpError:
-            pass
+    for i, (sender, subject, date) in enumerate(rows, 1):
+        table.add_row(str(i), sender, subject, date)
 
     console.print(table)
-    if len(msg_ids) > limit:
-        console.print(f"  [dim]... 외 {len(msg_ids) - limit}개[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +362,7 @@ def run_auto_pipeline(service, dry_run: bool):
                 f"[cyan]{rr.rule.description}[/cyan]  "
                 f"→  [bold red]{len(ids_to_delete)}개[/bold red] 삭제 예정\n"
             )
-            show_preview(service, ids_to_delete)
+            show_all_emails(service, ids_to_delete)
 
             if dry_run:
                 console.print(f"  [yellow][DRY RUN][/yellow] {len(ids_to_delete)}개 삭제 (스킵)\n")
